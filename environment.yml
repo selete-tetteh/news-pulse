@@ -24,6 +24,7 @@ dependencies:
     - spacy
     - sentence-transformers
     - textblob
+    - vadersentiment
     - prophet
     - plotly
     - streamlit
