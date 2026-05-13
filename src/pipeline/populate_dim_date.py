@@ -40,6 +40,8 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "3306")
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASS = os.getenv("DB_PASSWORD")
+if DB_PASS is None:
+    raise ValueError("DB_PASSWORD not found in .env — check your .env file exists and is populated")
 DB_NAME = os.getenv("DB_NAME", "news_pulse")
 
 # --- Build the date dimension dataframe ---
