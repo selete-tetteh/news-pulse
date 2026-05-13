@@ -117,4 +117,5 @@ INSERT IGNORE INTO dim_segment (segment_name, gdelt_themes) VALUES
     ('Sports',                  'SPORTS,SPORT'),
     ('Entertainment and Culture','ENTERTAIN,CULTURE,ARTS,MEDIA'),
     ('Science and Health',      'HEALTH,SCIENCE,MEDICAL,ENV'),
-    ('Crime and Justice',       'CRIME,LEGAL,JUSTICE,LAW');
+    ('Crime and Justice',       'CRIME,LEGAL,JUSTICE,LAW'),
+    ('General',                 '');
