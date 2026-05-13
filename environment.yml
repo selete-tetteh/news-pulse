@@ -1,0 +1,33 @@
+name: news-pulse
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - jupyter
+  - ipykernel
+  - pandas
+  - numpy
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - scipy
+  - statsmodels
+  - networkx
+  - sqlalchemy
+  - pymysql
+  - python-dotenv
+  - requests
+  - pip:
+    - gdelt
+    - spacy
+    - sentence-transformers
+    - textblob
+    - prophet
+    - plotly
+    - streamlit
+    - apscheduler
+    - reportlab
+    - openpyxl
+    - pytest

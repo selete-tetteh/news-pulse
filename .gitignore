@@ -1,0 +1,22 @@
+# Environment
+.env
+*.env
+
+# Data files — never committed
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Reports — charts and Excel outputs stay local
+reports/*
+!reports/.gitkeep
