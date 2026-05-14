@@ -187,8 +187,15 @@ def transform(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
     sentiment_results = df["source_name"].apply(_score_sentiment)
     df["sentiment_score"] = sentiment_results.apply(lambda x: x[0])
     df["sentiment_label"] = sentiment_results.apply(lambda x: x[1])
+    
+    # 3. Deduplicate on URL before loading.
+    # GDELT occasionally republishes the same article URL across multiple
+    # 15-minute windows. Deduplicating here means the database-level
+    # INSERT IGNORE acts as a second line of defence, not the first.
+    df = df.drop_duplicates(subset=["url"], keep="first")
+    log.info(f"After deduplication: {len(df)} articles (duplicates removed at transform stage)")
 
-    # 3. Entity extraction — build flat list with url as the join key
+    # 4. Entity extraction — build flat list with url as the join key
     entity_records = []
     persons_col = "persons" if "persons" in df.columns else None
     orgs_col    = "organizations" if "organizations" in df.columns else None
@@ -202,6 +209,7 @@ def transform(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
         entity_records.extend(entities)
 
     log.info(f"Extracted {len(entity_records)} entity mentions across {len(df)} articles")
+    
 
     # Keep only the columns the warehouse needs
     warehouse_cols = [
