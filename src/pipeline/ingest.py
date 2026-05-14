@@ -182,20 +182,31 @@ def fetch_latest() -> pd.DataFrame:
     return _download_and_parse_gkg(latest_url)
 
 
-def fetch_backfill(start_date: str, end_date: str) -> pd.DataFrame:
+def fetch_backfill(start_date: str, end_date: str, max_workers: int = 8) -> pd.DataFrame:
     """
     Fetches all GDELT GKG update files within a date range and
     concatenates them into a single DataFrame.
 
+    Files are downloaded in parallel using ThreadPoolExecutor.
+    Most of the time in a sequential fetch is spent waiting for
+    HTTP responses — parallelising the downloads means multiple
+    files are in-flight at once, cutting total runtime significantly.
+
+    max_workers controls how many simultaneous downloads run.
+    8 is a safe default. Drop to 4 if GDELT starts skipping files.
+
     Args:
-        start_date: inclusive start date, format 'YYYY-MM-DD'
-        end_date:   inclusive end date, format 'YYYY-MM-DD'
+        start_date:  inclusive start date, format 'YYYY-MM-DD'
+        end_date:    inclusive end date, format 'YYYY-MM-DD'
+        max_workers: number of parallel download threads
 
     Returns:
         DataFrame containing all articles from the date range.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     start = pd.to_datetime(start_date)
-    end   = pd.to_datetime(end_date) + timedelta(days=1)  # make end inclusive
+    end   = pd.to_datetime(end_date) + timedelta(days=1)
 
     master = _fetch_master_list()
     files_in_range = master[
@@ -207,17 +218,24 @@ def fetch_backfill(start_date: str, end_date: str) -> pd.DataFrame:
         log.warning(f"No GDELT files found between {start_date} and {end_date}")
         return pd.DataFrame()
 
-    log.info(f"Backfill: {len(files_in_range)} files to fetch ({start_date} to {end_date})")
+    urls = files_in_range["url"].tolist()
+    log.info(f"Backfill: {len(urls)} files to fetch ({start_date} to {end_date})")
 
     frames = []
-    for i, row in files_in_range.iterrows():
-        try:
-            df = _download_and_parse_gkg(row["url"])
-            frames.append(df)
-            log.info(f"  Fetched {len(df)} articles — {row['file_datetime']}")
-        except Exception as e:
-            log.warning(f"  Skipped {row['url']} — {e}")
-            continue
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_download_and_parse_gkg, url): url for url in urls}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                df = future.result()
+                frames.append(df)
+                completed += 1
+                if completed % 50 == 0:
+                    log.info(f"  Progress: {completed}/{len(urls)} files fetched")
+            except Exception as e:
+                log.warning(f"  Skipped {url} — {e}")
 
     if not frames:
         log.warning("Backfill completed with no data retrieved.")
