@@ -17,6 +17,17 @@ Loading order respects foreign key constraints:
 
 Duplicate articles (same URL) are skipped via INSERT IGNORE.
 
+Performance design:
+  Rows are inserted in bulk using executemany() and committed in batches
+  of BATCH_SIZE rows. This replaces the original row-by-row loop which
+  stalled on large datasets by issuing millions of individual round trips
+  to MySQL inside a single transaction.
+
+  Batched commits mean:
+    - Memory usage stays flat regardless of dataset size
+    - A failure only loses the current batch, not hours of work
+    - Progress is visible in the logs as each batch completes
+
 Usage:
   from src.pipeline.load import load
 
@@ -33,7 +44,14 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# How many rows to insert and commit at a time.
+# 5,000 is a safe default — large enough to be fast, small enough
+# that MySQL does not run out of memory on the batch.
+BATCH_SIZE = 5_000
+
+
 # --- Project root and credentials ---
+
 def find_project_root() -> Path:
     current = Path(__file__).resolve().parent
     while current != current.parent:
@@ -53,12 +71,9 @@ if DB_PASS is None:
     raise ValueError("DB_PASSWORD not found in .env — check your .env file exists and is populated")
 DB_NAME = os.getenv("DB_NAME", "news_pulse")
 
-if DB_PASS is None:
-    raise ValueError("DB_PASSWORD not found in .env — check your .env file exists and is populated")
-
 
 def get_engine():
-    password = quote_plus(DB_PASS) # pyright: ignore[reportArgumentType, reportCallIssue]
+    password = quote_plus(DB_PASS)  # pyright: ignore[reportArgumentType, reportCallIssue]
     return create_engine(
         f"mysql+pymysql://{DB_USER}:{password}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
         pool_pre_ping=True  # verifies connection is alive before using it
@@ -67,74 +82,83 @@ def get_engine():
 
 # --- Dimension loaders ---
 
-def _upsert_sources(conn, source_names: list[str]) -> dict[str, int]:
+def _upsert_sources(engine, source_names: list[str]) -> dict[str, int]:
     """
     Inserts any new source names into dim_source and returns
     a mapping of source_name -> source_id for all sources in the batch.
     INSERT IGNORE skips sources that already exist.
+
+    Uses a single bulk insert rather than one INSERT per source name.
     """
     if not source_names:
         return {}
 
-    # Insert new sources
-    for name in set(source_names):
+    unique_names = list(set(source_names))
+
+    with engine.begin() as conn:
+        # Bulk insert all new sources in one statement
         conn.execute(
             text("INSERT IGNORE INTO dim_source (source_name) VALUES (:name)"),
-            {"name": name}
+            [{"name": name} for name in unique_names]
         )
 
-    # Fetch IDs for all sources in this batch
-    placeholders = ", ".join([f":s{i}" for i in range(len(source_names))])
-    params = {f"s{i}": name for i, name in enumerate(set(source_names))}
-    result = conn.execute(
-        text(f"SELECT source_name, source_id FROM dim_source WHERE source_name IN ({placeholders})"),
-        params
-    )
-    return {row.source_name: row.source_id for row in result}
+        # Fetch IDs for all sources in this batch
+        placeholders = ", ".join([f":s{i}" for i in range(len(unique_names))])
+        params = {f"s{i}": name for i, name in enumerate(unique_names)}
+        result = conn.execute(
+            text(f"SELECT source_name, source_id FROM dim_source WHERE source_name IN ({placeholders})"),
+            params
+        )
+        return {row.source_name: row.source_id for row in result}
 
 
-def _lookup_date_ids(conn, dates: pd.Series) -> dict:
+def _lookup_date_ids(engine, dates: pd.Series) -> dict:
     """
     Looks up date_id values from dim_date for a Series of datetimes.
     date_id is stored as YYYYMMDD integer.
-    Dates not found in dim_date are excluded — this should not happen
-    if populate_dim_date.py was run and the date range is covered.
     """
     date_ints = dates.dropna().dt.strftime("%Y%m%d").astype(int).unique().tolist()
     if not date_ints:
         return {}
 
-    placeholders = ", ".join([f":d{i}" for i in range(len(date_ints))])
-    params = {f"d{i}": d for i, d in enumerate(date_ints)}
-    result = conn.execute(
-        text(f"SELECT date_id, full_date FROM dim_date WHERE date_id IN ({placeholders})"),
-        params
-    )
-    return {str(row.full_date): row.date_id for row in result}
+    with engine.connect() as conn:
+        placeholders = ", ".join([f":d{i}" for i in range(len(date_ints))])
+        params = {f"d{i}": d for i, d in enumerate(date_ints)}
+        result = conn.execute(
+            text(f"SELECT date_id, full_date FROM dim_date WHERE date_id IN ({placeholders})"),
+            params
+        )
+        return {str(row.full_date): row.date_id for row in result}
 
 
-def _lookup_segment_ids(conn) -> dict[str, int]:
+def _lookup_segment_ids(engine) -> dict[str, int]:
     """
     Loads the full segment name -> segment_id mapping from dim_segment.
-    This is a small table (7 rows) so we load it all at once.
+    Small table (8 rows) so we load it all at once.
     """
-    result = conn.execute(text("SELECT segment_id, segment_name FROM dim_segment"))
-    return {row.segment_name: row.segment_id for row in result}
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT segment_id, segment_name FROM dim_segment"))
+        return {row.segment_name: row.segment_id for row in result}
 
 
 # --- Fact loaders ---
 
-def _insert_articles(conn, df: pd.DataFrame,
+def _insert_articles(engine, df: pd.DataFrame,
                      source_map: dict, date_map: dict,
                      segment_map: dict) -> dict[str, int]:
     """
-    Inserts articles into fact_articles after resolving all foreign keys.
-    Returns a mapping of url -> article_id for use when loading entity mentions.
-    Rows where any foreign key lookup fails are skipped with a warning.
+    Inserts articles into fact_articles in batches of BATCH_SIZE rows.
+
+    Each batch is committed independently. This keeps memory usage flat
+    and means a failure only rolls back the current batch.
+
+    Returns a url -> article_id mapping built from all inserted rows,
+    used when loading entity mentions.
     """
-    inserted = 0
-    skipped  = 0
-    url_to_article_id = {}
+    # Build the full list of row dicts upfront, resolving all foreign keys.
+    # Rows where any foreign key lookup fails are skipped.
+    rows = []
+    skipped = 0
 
     for _, row in df.iterrows():
         source_id  = source_map.get(row.get("source_name"))
@@ -147,14 +171,7 @@ def _insert_articles(conn, df: pd.DataFrame,
             skipped += 1
             continue
 
-        result = conn.execute(text("""
-            INSERT IGNORE INTO fact_articles
-                (source_id, date_id, segment_id, url, seendate,
-                 sentiment_score, sentiment_label, language)
-            VALUES
-                (:source_id, :date_id, :segment_id, :url, :seendate,
-                 :sentiment_score, :sentiment_label, :language)
-        """), {
+        rows.append({
             "source_id":       source_id,
             "date_id":         date_id,
             "segment_id":      segment_id,
@@ -165,50 +182,81 @@ def _insert_articles(conn, df: pd.DataFrame,
             "language":        row.get("language", "English"),
         })
 
-        if result.rowcount > 0:
-            inserted += 1
-            # Fetch the article_id for the entity mentions join
-            id_result = conn.execute(
-                text("SELECT article_id FROM fact_articles WHERE url = :url"),
-                {"url": str(row.get("url", ""))}
-            )
-            id_row = id_result.fetchone()
-            if id_row:
-                url_to_article_id[str(row.get("url", ""))] = id_row.article_id
+    if skipped:
+        log.warning(f"fact_articles — skipped {skipped} rows (missing foreign key lookup)")
 
-    log.info(f"fact_articles — inserted: {inserted}, skipped: {skipped}")
+    # Insert in batches and commit after each batch
+    inserted = 0
+    for i in range(0, len(rows), BATCH_SIZE):
+        batch = rows[i: i + BATCH_SIZE]
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT IGNORE INTO fact_articles
+                    (source_id, date_id, segment_id, url, seendate,
+                     sentiment_score, sentiment_label, language)
+                VALUES
+                    (:source_id, :date_id, :segment_id, :url, :seendate,
+                     :sentiment_score, :sentiment_label, :language)
+            """), batch)
+        inserted += len(batch)
+        log.info(f"fact_articles — committed batch {i // BATCH_SIZE + 1} "
+                 f"({inserted}/{len(rows)} rows)")
+
+    log.info(f"fact_articles — total inserted: {inserted}, skipped: {skipped}")
+
+    # Build url -> article_id map by fetching all URLs we just inserted.
+    # Done in one query rather than one SELECT per row.
+    url_to_article_id = {}
+    urls = [r["url"] for r in rows]
+
+    for i in range(0, len(urls), BATCH_SIZE):
+        url_batch = urls[i: i + BATCH_SIZE]
+        placeholders = ", ".join([f":u{j}" for j in range(len(url_batch))])
+        params = {f"u{j}": url for j, url in enumerate(url_batch)}
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(f"SELECT article_id, url FROM fact_articles WHERE url IN ({placeholders})"),
+                params
+            )
+            for row in result:
+                url_to_article_id[row.url] = row.article_id
+
     return url_to_article_id
 
 
-def _insert_entities(conn, entity_records: list[dict],
+def _insert_entities(engine, entity_records: list[dict],
                      url_to_article_id: dict) -> None:
     """
-    Upserts entities into dim_entity, then inserts mention records
-    into fact_entity_mentions using the url -> article_id mapping.
+    Upserts entities into dim_entity in bulk, then inserts mention records
+    into fact_entity_mentions in batches of BATCH_SIZE rows.
     """
     if not entity_records:
         log.info("No entity records to load")
         return
 
-    # Upsert all unique entities into dim_entity
-    unique_entities = {
+    # Bulk upsert all unique entities in one pass
+    unique_entities = list({
         (e["entity_name"], e["entity_type"])
         for e in entity_records
-    }
+    })
 
-    for name, etype in unique_entities:
-        conn.execute(text("""
-            INSERT IGNORE INTO dim_entity (entity_name, entity_type)
-            VALUES (:name, :etype)
-        """), {"name": name, "etype": etype})
+    for i in range(0, len(unique_entities), BATCH_SIZE):
+        batch = unique_entities[i: i + BATCH_SIZE]
+        with engine.begin() as conn:
+            conn.execute(
+                text("INSERT IGNORE INTO dim_entity (entity_name, entity_type) VALUES (:name, :etype)"),
+                [{"name": name, "etype": etype} for name, etype in batch]
+            )
 
-    # Build entity lookup map
-    result = conn.execute(text("SELECT entity_id, entity_name, entity_type FROM dim_entity"))
-    entity_map = {(row.entity_name, row.entity_type): row.entity_id for row in result}
+    # Load full entity map after all upserts are committed
+    entity_map = {}
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT entity_id, entity_name, entity_type FROM dim_entity"))
+        entity_map = {(row.entity_name, row.entity_type): row.entity_id for row in result}
 
-    # Insert mention records
-    inserted = 0
-    skipped  = 0
+    # Build mention rows, resolving article_id and entity_id
+    mention_rows = []
+    skipped = 0
 
     for record in entity_records:
         article_id = url_to_article_id.get(record["url"])
@@ -218,13 +266,28 @@ def _insert_entities(conn, entity_records: list[dict],
             skipped += 1
             continue
 
-        conn.execute(text("""
-            INSERT IGNORE INTO fact_entity_mentions (article_id, entity_id)
-            VALUES (:article_id, :entity_id)
-        """), {"article_id": article_id, "entity_id": entity_id})
-        inserted += 1
+        mention_rows.append({
+            "article_id": article_id,
+            "entity_id":  entity_id,
+        })
 
-    log.info(f"fact_entity_mentions — inserted: {inserted}, skipped: {skipped}")
+    if skipped:
+        log.warning(f"fact_entity_mentions — skipped {skipped} rows (unresolved foreign key)")
+
+    # Insert mentions in batches
+    inserted = 0
+    for i in range(0, len(mention_rows), BATCH_SIZE):
+        batch = mention_rows[i: i + BATCH_SIZE]
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT IGNORE INTO fact_entity_mentions (article_id, entity_id)
+                VALUES (:article_id, :entity_id)
+            """), batch)
+        inserted += len(batch)
+        log.info(f"fact_entity_mentions — committed batch {i // BATCH_SIZE + 1} "
+                 f"({inserted}/{len(mention_rows)} rows)")
+
+    log.info(f"fact_entity_mentions — total inserted: {inserted}, skipped: {skipped}")
 
 
 # --- Main load function ---
@@ -232,8 +295,10 @@ def _insert_entities(conn, entity_records: list[dict],
 def load(df_articles: pd.DataFrame, entity_records: list[dict]) -> None:
     """
     Loads transformed articles and entity records into the warehouse.
-    All inserts run inside a single transaction — if anything fails,
-    the entire batch is rolled back so the warehouse stays consistent.
+
+    Dimension lookups are resolved upfront. Fact table inserts are committed
+    in batches of BATCH_SIZE rows so memory usage stays flat and progress
+    is visible in the logs throughout the run.
     """
     if df_articles.empty:
         log.warning("load() received an empty DataFrame — nothing to load")
@@ -243,16 +308,16 @@ def load(df_articles: pd.DataFrame, entity_records: list[dict]) -> None:
 
     engine = get_engine()
 
-    with engine.begin() as conn:
-        source_names = df_articles["source_name"].dropna().unique().tolist()
-        source_map   = _upsert_sources(conn, source_names)
-        date_map     = _lookup_date_ids(conn, df_articles["seendate"])
-        segment_map  = _lookup_segment_ids(conn)
+    # Resolve all dimension lookups before touching fact tables
+    source_names = df_articles["source_name"].dropna().unique().tolist()
+    source_map   = _upsert_sources(engine, source_names)
+    date_map     = _lookup_date_ids(engine, df_articles["seendate"])
+    segment_map  = _lookup_segment_ids(engine)
 
-        url_to_article_id = _insert_articles(
-            conn, df_articles, source_map, date_map, segment_map
-        )
-        _insert_entities(conn, entity_records, url_to_article_id)
+    url_to_article_id = _insert_articles(
+        engine, df_articles, source_map, date_map, segment_map
+    )
+    _insert_entities(engine, entity_records, url_to_article_id)
 
     log.info("Load complete")
 
@@ -270,7 +335,7 @@ if __name__ == "__main__":
     from src.pipeline.transform import transform
 
     log.info("Running full pipeline test: ingest -> transform -> load")
-    df_raw                    = fetch_latest()
+    df_raw                      = fetch_latest()
     df_articles, entity_records = transform(df_raw)
     load(df_articles, entity_records)
 
