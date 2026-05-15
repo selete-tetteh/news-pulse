@@ -12,6 +12,17 @@ line is appended pointing to the latest GKG file. Each file is a compressed
 CSV covering that window. This script reads the master list, identifies the
 relevant files, downloads and decompresses them, and returns a clean DataFrame.
 
+Master list caching:
+  The master file list is 386,000+ lines and takes ~2.5 minutes to download.
+  For a live pipeline running every 15 minutes, downloading the full list on
+  every run adds unacceptable overhead. The list is cached locally and reused
+  if it is less than CACHE_MAX_AGE_HOURS old. If the cache is stale or missing,
+  a full download runs and the result is saved to disk.
+
+  The cache is safe because the master list is append-only — lines are never
+  edited or removed, only added. Reading a cached version never misses updates
+  that existed at cache time.
+
 Usage:
   from src.pipeline.ingest import fetch_latest, fetch_backfill
 
@@ -19,15 +30,16 @@ Usage:
   df_backfill = fetch_backfill("2024-01-01", "2024-01-07")
 """
 
-import os
 import io
 import logging
+import time
 import zipfile
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 from pathlib import Path
-from urllib.parse import quote_plus
+
+import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 # --- Project root and logging ---
@@ -54,19 +66,26 @@ log = logging.getLogger(__name__)
 # the size, MD5 hash, and URL of one 15-minute GKG update file.
 GDELT_MASTER_URL = "http://data.gdeltproject.org/gdeltv2/masterfilelist.txt"
 
+# Cache location and expiry.
+# data/processed/ is already in .gitignore so the cache is never committed.
+# 6 hours is a safe expiry — long enough to avoid redundant downloads during
+# a backfill session, short enough that the live pipeline always has fresh data.
+MASTER_LIST_CACHE = PROJECT_ROOT / "data" / "processed" / "gdelt_master_cache.csv"
+CACHE_MAX_AGE_HOURS = 6
+
 # GKG columns we keep. The full GKG has 27 columns — most are not
 # relevant for this project. We keep only what the warehouse needs.
 KEEP_COLS = {
-    "DATE":       "seendate",
-    "SourceCommonName": "source_name",
-    "DocumentIdentifier": "url",
-    "Themes":     "themes",
-    "Locations":  "locations",
-    "Persons":    "persons",
-    "Organizations": "organizations",
-    "SharingImage": "image_url",
-    "Extras":     "extras",
-    "TranslationInfo": "language_info",
+    "DATE":                 "seendate",
+    "SourceCommonName":     "source_name",
+    "DocumentIdentifier":   "url",
+    "Themes":               "themes",
+    "Locations":            "locations",
+    "Persons":              "persons",
+    "Organizations":        "organizations",
+    "SharingImage":         "image_url",
+    "Extras":               "extras",
+    "TranslationInfo":      "language_info",
 }
 
 # Full GKG column names in order (GDELT GKG 2.0 spec)
@@ -84,9 +103,39 @@ GKG_COLUMNS = [
 
 def _fetch_master_list() -> pd.DataFrame:
     """
-    Downloads the GDELT master file list and returns it as a DataFrame.
-    Each row is one 15-minute update file with its size, hash, and URL.
+    Returns the GDELT master file list as a DataFrame.
+
+    Checks for a local cache first. If the cache exists and is less than
+    CACHE_MAX_AGE_HOURS old, it is loaded from disk — no network request.
+    If the cache is stale or missing, a full download runs and the result
+    is saved to disk for future calls.
+
+    Why cache?
+      The master list is ~386,000 lines and takes ~2.5 minutes to download.
+      For a live pipeline running every 15 minutes, this overhead is
+      unacceptable. The list is append-only, so a cached version is always
+      a valid subset of the current list — it never contains incorrect data,
+      only potentially missing the most recent entries.
     """
+    # Check cache freshness
+    if MASTER_LIST_CACHE.exists():
+        age_seconds = time.time() - MASTER_LIST_CACHE.stat().st_mtime
+        age_hours   = age_seconds / 3600
+
+        if age_hours < CACHE_MAX_AGE_HOURS:
+            log.info(
+                f"Loading master list from cache "
+                f"(age: {age_hours:.1f}h, expires in {CACHE_MAX_AGE_HOURS - age_hours:.1f}h)"
+            )
+            df = pd.read_csv(MASTER_LIST_CACHE, parse_dates=["file_datetime"])
+            log.info(f"Master list loaded from cache — {len(df)} GKG files")
+            return df
+        else:
+            log.info(f"Master list cache is stale ({age_hours:.1f}h old) — refreshing")
+    else:
+        log.info("No master list cache found — downloading")
+
+    # Full download
     log.info("Fetching GDELT master file list...")
     response = requests.get(GDELT_MASTER_URL, timeout=60)
     response.raise_for_status()
@@ -111,7 +160,11 @@ def _fetch_master_list() -> pd.DataFrame:
         format="%Y%m%d%H%M%S"
     )
 
-    log.info(f"Master list loaded — {len(df)} GKG files found")
+    # Save to cache
+    MASTER_LIST_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(MASTER_LIST_CACHE, index=False)
+    log.info(f"Master list saved to cache — {len(df)} GKG files")
+
     return df
 
 
@@ -188,25 +241,26 @@ def fetch_backfill(start_date: str, end_date: str, max_workers: int = 8) -> pd.D
     concatenates them into a single DataFrame.
 
     Files are downloaded in parallel using ThreadPoolExecutor.
-    Most of the time in a sequential fetch is spent waiting for
-    HTTP responses — parallelising the downloads means multiple
-    files are in-flight at once, cutting total runtime significantly.
+    Most of the time in a sequential fetch is network waiting, not
+    computation. Parallelising the downloads means multiple files are
+    in-flight at once, significantly reducing total runtime.
 
-    max_workers controls how many simultaneous downloads run.
-    8 is a safe default. Drop to 4 if GDELT starts skipping files.
+    The master list is loaded once per call — when the backfill runs
+    day-by-day from run_pipeline.py, the cache means subsequent days
+    skip the download entirely.
 
     Args:
         start_date:  inclusive start date, format 'YYYY-MM-DD'
         end_date:    inclusive end date, format 'YYYY-MM-DD'
-        max_workers: number of parallel download threads
+        max_workers: number of parallel download threads.
+                     8 is a safe default. Drop to 4 if GDELT starts
+                     returning errors or skipping files at high volume.
 
     Returns:
         DataFrame containing all articles from the date range.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     start = pd.to_datetime(start_date)
-    end   = pd.to_datetime(end_date) + timedelta(days=1)
+    end   = pd.to_datetime(end_date) + timedelta(days=1)  # make end inclusive
 
     master = _fetch_master_list()
     files_in_range = master[
@@ -221,7 +275,7 @@ def fetch_backfill(start_date: str, end_date: str, max_workers: int = 8) -> pd.D
     urls = files_in_range["url"].tolist()
     log.info(f"Backfill: {len(urls)} files to fetch ({start_date} to {end_date})")
 
-    frames = []
+    frames    = []
     completed = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:

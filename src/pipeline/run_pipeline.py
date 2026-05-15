@@ -8,9 +8,17 @@ Two modes:
   --mode live      Fetches the single most recent GDELT 15-minute update.
                    Used by the scheduler for continuous live updates.
 
-  --mode backfill  Fetches all GDELT files within a date range.
-                   Used once to seed the warehouse with historical data.
+  --mode backfill  Fetches GDELT files within a date range, processing one
+                   day at a time to keep memory usage flat.
                    Requires --start and --end arguments.
+
+Why process backfill day by day?
+  A naive backfill fetches all files in the range into one DataFrame before
+  transforming and loading. For large ranges (3 months = ~11 million articles),
+  this exhausts available RAM and the OS kills the process before anything
+  is written to the database. Processing one day at a time (~130k articles)
+  keeps each batch well within memory limits. Each day's data is transformed,
+  loaded, and discarded before the next day begins.
 
 Why an orchestrator?
   The three pipeline modules (ingest, transform, load) each do one job.
@@ -21,7 +29,7 @@ Why an orchestrator?
 Usage:
   python -m src.pipeline.run_pipeline --mode live
 
-  python -m src.pipeline.run_pipeline --mode backfill --start 2025-05-06 --end 2025-05-12
+  python -m src.pipeline.run_pipeline --mode backfill --start 2025-02-07 --end 2025-05-06
 
   # Dry run — fetch and transform only, skip the database write.
   # Useful for verifying the pipeline produces sensible output before
@@ -33,6 +41,9 @@ import argparse
 import logging
 import sys
 import time
+from datetime import timedelta
+
+import pandas as pd
 
 from src.pipeline.ingest import fetch_latest, fetch_backfill
 from src.pipeline.transform import transform
@@ -87,56 +98,123 @@ def run(mode: str, start_date: str | None = None, end_date: str | None = None,
     start_time = time.time()
 
     try:
-        # --- Step 1: Ingest ---
         log.info(f"Pipeline starting — mode: {mode}")
 
+        # -------------------------------------------------------------------
+        # Live mode — single 15-minute update
+        # -------------------------------------------------------------------
         if mode == "live":
             log.info("Fetching latest GDELT update...")
             df_raw = fetch_latest()
 
+            if df_raw.empty:
+                log.warning("Ingest returned zero articles. Nothing to process.")
+                summary["status"] = "empty"
+                return summary
+
+            summary["articles_fetched"] = len(df_raw)
+            log.info(f"Ingest complete — {len(df_raw)} articles fetched")
+
+            log.info("Transforming articles...")
+            df_articles, entity_records = transform(df_raw)
+            summary["entities_extracted"] = len(entity_records)
+
+            if dry_run:
+                log.info("Dry run — skipping load step. No data written to warehouse.")
+            else:
+                log.info("Loading into warehouse...")
+                load(df_articles, entity_records)
+                summary["loaded"] = True
+                log.info("Load complete")
+
+            summary["status"] = "success"
+
+        # -------------------------------------------------------------------
+        # Backfill mode — process one day at a time
+        #
+        # Why day by day?
+        #   Loading 3 months of data (11M articles) as a single DataFrame
+        #   exhausts RAM — the OS killed the process before load() ran.
+        #   Each daily batch is ~130k articles, safely within memory limits.
+        #   The batch is discarded after load() commits, so memory stays flat
+        #   across the full backfill run.
+        # -------------------------------------------------------------------
         elif mode == "backfill":
             if not start_date or not end_date:
                 raise ValueError(
                     "Backfill mode requires --start and --end arguments. "
-                    "Example: --start 2025-05-06 --end 2025-05-12"
+                    "Example: --start 2025-02-07 --end 2025-05-06"
                 )
+
+            current       = pd.to_datetime(start_date)
+            end           = pd.to_datetime(end_date)
+            total_articles = 0
+            total_entities = 0
+            day_number     = 0
+            days_skipped   = 0
+
             log.info(f"Starting backfill: {start_date} to {end_date}")
-            df_raw = fetch_backfill(start_date, end_date)
+            log.info(f"Processing one day at a time to keep memory usage flat")
+
+            while current <= end:
+                day_str = current.strftime("%Y-%m-%d")
+                day_number += 1
+
+                log.info(f"--- Day {day_number}: {day_str} ---")
+
+                try:
+                    df_raw = fetch_backfill(day_str, day_str)
+
+                    if df_raw.empty:
+                        log.warning(f"No data returned for {day_str} — skipping")
+                        days_skipped += 1
+                        current += timedelta(days=1)
+                        continue
+
+                    df_articles, entity_records = transform(df_raw)
+
+                    if dry_run:
+                        log.info(
+                            f"Dry run — {len(df_articles)} articles, "
+                            f"{len(entity_records)} entities (not written)"
+                        )
+                    else:
+                        load(df_articles, entity_records)
+                        summary["loaded"] = True
+
+                    total_articles += len(df_articles)
+                    total_entities += len(entity_records)
+
+                    log.info(
+                        f"Day {day_str} complete — "
+                        f"{len(df_articles)} articles, {len(entity_records)} entities "
+                        f"| Running total: {total_articles:,} articles"
+                    )
+
+                except Exception as day_error:
+                    # Log the failure for this day but continue to the next.
+                    # A single bad day should not abort a multi-month backfill.
+                    log.error(f"Day {day_str} failed: {day_error} — continuing to next day")
+                    days_skipped += 1
+
+                current += timedelta(days=1)
+
+            summary["articles_fetched"]   = total_articles
+            summary["entities_extracted"] = total_entities
+            summary["status"]             = "success"
+
+            log.info(
+                f"Backfill complete — {total_articles:,} articles across "
+                f"{day_number - days_skipped} days ({days_skipped} days skipped)"
+            )
 
         else:
             raise ValueError(f"Unknown mode '{mode}'. Use 'live' or 'backfill'.")
 
-        if df_raw.empty:
-            log.warning("Ingest returned zero articles. Nothing to process.")
-            summary["status"] = "empty"
-            return summary
-
-        summary["articles_fetched"] = len(df_raw)
-        log.info(f"Ingest complete — {len(df_raw)} articles fetched")
-
-        # --- Step 2: Transform ---
-        log.info("Transforming articles...")
-        df_articles, entity_records = transform(df_raw)
-        summary["entities_extracted"] = len(entity_records)
-        log.info(f"Transform complete — {len(df_articles)} articles, "
-                 f"{len(entity_records)} entity mentions")
-
-        # --- Step 3: Load ---
-        if dry_run:
-            log.info("Dry run — skipping load step. No data written to warehouse.")
-            summary["loaded"] = False
-        else:
-            log.info("Loading into warehouse...")
-            load(df_articles, entity_records)
-            summary["loaded"] = True
-            log.info("Load complete")
-
-        summary["status"] = "success"
-
     except Exception as e:
         log.error(f"Pipeline failed: {e}", exc_info=True)
         summary["status"] = "failed"
-        summary["error"] = str(e)
+        summary["error"]  = str(e)
 
     finally:
         summary["duration_seconds"] = round(time.time() - start_time, 2)
@@ -155,7 +233,7 @@ def main():
         epilog="""
 Examples:
   python -m src.pipeline.run_pipeline --mode live
-  python -m src.pipeline.run_pipeline --mode backfill --start 2025-05-06 --end 2025-05-12
+  python -m src.pipeline.run_pipeline --mode backfill --start 2025-02-07 --end 2025-05-06
   python -m src.pipeline.run_pipeline --mode live --dry-run
         """
     )
@@ -165,7 +243,7 @@ Examples:
         required=True,
         choices=["live", "backfill"],
         help="'live' fetches the latest 15-minute GDELT update. "
-             "'backfill' fetches a full date range."
+             "'backfill' fetches a full date range, one day at a time."
     )
     parser.add_argument(
         "--start",
@@ -199,8 +277,8 @@ Examples:
     print("=" * 50)
     print(f"  Mode:               {summary['mode']}")
     print(f"  Status:             {summary['status'].upper()}")
-    print(f"  Articles fetched:   {summary['articles_fetched']}")
-    print(f"  Entities extracted: {summary['entities_extracted']}")
+    print(f"  Articles fetched:   {summary['articles_fetched']:,}")
+    print(f"  Entities extracted: {summary['entities_extracted']:,}")
     print(f"  Written to DB:      {'Yes' if summary['loaded'] else 'No'}")
     print(f"  Duration:           {summary['duration_seconds']}s")
     if summary["error"]:
