@@ -229,17 +229,24 @@ def _insert_entities(engine, entity_records: list[dict],
     """
     Upserts entities into dim_entity in bulk, then inserts mention records
     into fact_entity_mentions in batches of BATCH_SIZE rows.
+
+    Entity ID lookup is scoped to only the entities in this batch.
+    Loading the full dim_entity table was causing a 4-5 minute pause on
+    later days of the backfill because the table had grown to hundreds of
+    thousands of rows. Scoping the SELECT to the current batch keeps the
+    lookup fast regardless of how large dim_entity grows over time.
     """
     if not entity_records:
         log.info("No entity records to load")
         return
 
-    # Bulk upsert all unique entities in one pass
+    # Collect unique (name, type) pairs from this batch only
     unique_entities = list({
         (e["entity_name"], e["entity_type"])
         for e in entity_records
     })
 
+    # Bulk upsert all unique entities in one pass
     for i in range(0, len(unique_entities), BATCH_SIZE):
         batch = unique_entities[i: i + BATCH_SIZE]
         with engine.begin() as conn:
@@ -248,11 +255,29 @@ def _insert_entities(engine, entity_records: list[dict],
                 [{"name": name, "etype": etype} for name, etype in batch]
             )
 
-    # Load full entity map after all upserts are committed
+    # Fetch entity IDs for only the entities in this batch.
+    # We build parameterised placeholders for each (name, type) pair and
+    # fetch in chunks of BATCH_SIZE to avoid hitting MySQL's max_allowed_packet
+    # limit on very large batches.
     entity_map = {}
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT entity_id, entity_name, entity_type FROM dim_entity"))
-        entity_map = {(row.entity_name, row.entity_type): row.entity_id for row in result}
+    for i in range(0, len(unique_entities), BATCH_SIZE):
+        chunk = unique_entities[i: i + BATCH_SIZE]
+        # Build one param dict per pair: name0, etype0, name1, etype1, ...
+        params = {}
+        conditions = []
+        for j, (name, etype) in enumerate(chunk):
+            params[f"name{j}"]  = name
+            params[f"etype{j}"] = etype
+            conditions.append(f"(entity_name = :name{j} AND entity_type = :etype{j})")
+
+        where_clause = " OR ".join(conditions)
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(f"SELECT entity_id, entity_name, entity_type FROM dim_entity WHERE {where_clause}"),
+                params
+            )
+            for row in result:
+                entity_map[(row.entity_name, row.entity_type)] = row.entity_id
 
     # Build mention rows, resolving article_id and entity_id
     mention_rows = []
