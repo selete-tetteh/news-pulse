@@ -146,15 +146,25 @@ def run(mode: str, start_date: str | None = None, end_date: str | None = None,
                     "Example: --start 2025-02-07 --end 2025-05-06"
                 )
 
-            current       = pd.to_datetime(start_date)
-            end           = pd.to_datetime(end_date)
+            current        = pd.to_datetime(start_date)
+            end            = pd.to_datetime(end_date)
             total_articles = 0
             total_entities = 0
             day_number     = 0
             days_skipped   = 0
 
             log.info(f"Starting backfill: {start_date} to {end_date}")
-            log.info(f"Processing one day at a time to keep memory usage flat")
+            log.info("Processing one day at a time to keep memory usage flat")
+
+            # Download the master list once before the day loop begins.
+            # This writes a fresh cache to disk. Every fetch_backfill() call
+            # inside the loop then uses force_cache=True, which skips the age
+            # check entirely. A long backfill (10+ hours) would otherwise hit
+            # the 6-hour expiry mid-run and re-download the full 386k-line list.
+            log.info("Pre-fetching master list before backfill loop...")
+            from src.pipeline.ingest import _fetch_master_list
+            _fetch_master_list(force_cache=False)  # fresh download, resets cache timestamp
+            log.info("Master list ready. Starting day loop with force_cache=True.")
 
             while current <= end:
                 day_str = current.strftime("%Y-%m-%d")
@@ -163,7 +173,7 @@ def run(mode: str, start_date: str | None = None, end_date: str | None = None,
                 log.info(f"--- Day {day_number}: {day_str} ---")
 
                 try:
-                    df_raw = fetch_backfill(day_str, day_str)
+                    df_raw = fetch_backfill(day_str, day_str, force_cache=True)
 
                     if df_raw.empty:
                         log.warning(f"No data returned for {day_str} — skipping")
@@ -192,8 +202,6 @@ def run(mode: str, start_date: str | None = None, end_date: str | None = None,
                     )
 
                 except Exception as day_error:
-                    # Log the failure for this day but continue to the next.
-                    # A single bad day should not abort a multi-month backfill.
                     log.error(f"Day {day_str} failed: {day_error} — continuing to next day")
                     days_skipped += 1
 

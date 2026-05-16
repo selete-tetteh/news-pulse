@@ -101,7 +101,7 @@ GKG_COLUMNS = [
 
 # --- Core fetch functions ---
 
-def _fetch_master_list() -> pd.DataFrame:
+def _fetch_master_list(force_cache: bool = False) -> pd.DataFrame:
     """
     Returns the GDELT master file list as a DataFrame.
 
@@ -110,6 +110,12 @@ def _fetch_master_list() -> pd.DataFrame:
     If the cache is stale or missing, a full download runs and the result
     is saved to disk for future calls.
 
+    Args:
+        force_cache: if True, skip the age check and load from disk regardless
+                     of how old the cache is. Used by backfill runs to prevent
+                     a mid-run re-download when a long backfill crosses the
+                     6-hour expiry threshold.
+
     Why cache?
       The master list is ~386,000 lines and takes ~2.5 minutes to download.
       For a live pipeline running every 15 minutes, this overhead is
@@ -117,8 +123,13 @@ def _fetch_master_list() -> pd.DataFrame:
       a valid subset of the current list — it never contains incorrect data,
       only potentially missing the most recent entries.
     """
-    # Check cache freshness
     if MASTER_LIST_CACHE.exists():
+        if force_cache:
+            log.info("Loading master list from cache (force_cache=True — age check skipped)")
+            df = pd.read_csv(MASTER_LIST_CACHE, parse_dates=["file_datetime"])
+            log.info(f"Master list loaded from cache — {len(df)} GKG files")
+            return df
+
         age_seconds = time.time() - MASTER_LIST_CACHE.stat().st_mtime
         age_hours   = age_seconds / 3600
 
@@ -153,14 +164,11 @@ def _fetch_master_list() -> pd.DataFrame:
 
     df = pd.DataFrame(records)
 
-    # Extract the datetime from the filename.
-    # GDELT filenames follow the pattern: YYYYMMDDHHMMSS.gkg.csv.zip
     df["file_datetime"] = pd.to_datetime(
         df["url"].str.extract(r"(\d{14})")[0],
         format="%Y%m%d%H%M%S"
     )
 
-    # Save to cache
     MASTER_LIST_CACHE.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(MASTER_LIST_CACHE, index=False)
     log.info(f"Master list saved to cache — {len(df)} GKG files")
@@ -235,7 +243,8 @@ def fetch_latest() -> pd.DataFrame:
     return _download_and_parse_gkg(latest_url)
 
 
-def fetch_backfill(start_date: str, end_date: str, max_workers: int = 8) -> pd.DataFrame:
+def fetch_backfill(start_date: str, end_date: str, max_workers: int = 8,
+                   force_cache: bool = False) -> pd.DataFrame:
     """
     Fetches all GDELT GKG update files within a date range and
     concatenates them into a single DataFrame.
@@ -255,14 +264,16 @@ def fetch_backfill(start_date: str, end_date: str, max_workers: int = 8) -> pd.D
         max_workers: number of parallel download threads.
                      8 is a safe default. Drop to 4 if GDELT starts
                      returning errors or skipping files at high volume.
+        force_cache: passed through to _fetch_master_list(). Set to True
+                     during long backfill runs to prevent mid-run cache expiry.
 
     Returns:
         DataFrame containing all articles from the date range.
     """
     start = pd.to_datetime(start_date)
-    end   = pd.to_datetime(end_date) + timedelta(days=1)  # make end inclusive
+    end   = pd.to_datetime(end_date) + timedelta(days=1)
 
-    master = _fetch_master_list()
+    master = _fetch_master_list(force_cache=force_cache)
     files_in_range = master[
         (master["file_datetime"] >= start) &
         (master["file_datetime"] <  end)
