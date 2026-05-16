@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+
+<!--
+  com.newspulse.pipeline.plist
+  macOS launchd service definition for the News Pulse live pipeline.
+
+  This file tells macOS to run the pipeline every 15 minutes automatically,
+  starting on login and restarting after crashes — without keeping a terminal
+  open or manually starting the scheduler.
+
+  SETUP (do this yourself when you're ready):
+
+  1. Edit the three placeholders below:
+       YOUR_USERNAME     → your macOS username (run `whoami` to check)
+       YOUR_CONDA_PATH   → full path to your conda python binary
+                           Run: which python   (with news-pulse env active)
+       YOUR_PROJECT_PATH → full path to the news-pulse project folder
+
+  2. Copy the file to the launchd agents folder:
+       cp launchd/com.newspulse.pipeline.plist ~/Library/LaunchAgents/
+
+  3. Load it into launchd:
+       launchctl load ~/Library/LaunchAgents/com.newspulse.pipeline.plist
+
+  4. Confirm it is running:
+       launchctl list | grep newspulse
+
+  To stop and unload:
+       launchctl unload ~/Library/LaunchAgents/com.newspulse.pipeline.plist
+
+  To check logs:
+       tail -f /tmp/newspulse_pipeline.log
+       tail -f /tmp/newspulse_pipeline_error.log
+
+  How launchd differs from APScheduler:
+    APScheduler is a Python process you start manually. If it crashes or
+    the Mac reboots, it stops. launchd is managed by macOS itself — it
+    starts the job on login, restarts it after crashes, and fires it on
+    the interval you define. Nothing needs to be running for it to work.
+    This is the production approach for a Mac-hosted pipeline.
+
+  Why StartInterval and not a cron expression?
+    launchd supports both. StartInterval (seconds) is simpler for a fixed
+    interval. 900 seconds = 15 minutes, matching GDELT's publish cadence.
+-->
+
+<plist version="1.0">
+<dict>
+
+    <!-- Unique label — must match the filename -->
+    <key>Label</key>
+    <string>com.newspulse.pipeline</string>
+
+    <!-- The command to run. Use the full path to the conda python binary
+         so launchd does not depend on your shell PATH being configured. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/miniconda3/envs/news-pulse/bin/python</string>
+        <string>-m</string>
+        <string>src.pipeline.run_pipeline</string>
+        <string>--mode</string>
+        <string>live</string>
+    </array>
+
+    <!-- Working directory — must be the project root so module imports resolve -->
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/Downloads/Data Stuff/Github refurb/news-pulse</string>
+
+    <!-- Fire every 900 seconds (15 minutes) -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- Start automatically when you log in -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart automatically if the process crashes -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Log stdout and stderr to files you can tail -->
+    <key>StandardOutPath</key>
+    <string>/tmp/newspulse_pipeline.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/newspulse_pipeline_error.log</string>
+
+    <!-- Throttle restarts — if the job crashes repeatedly, wait 30s before retrying -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+</dict>
+</plist>
