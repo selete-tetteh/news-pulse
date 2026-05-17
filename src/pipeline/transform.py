@@ -49,13 +49,31 @@ log.info("VADER initialised")
 # that map to that segment. Order matters — the first match wins,
 # so more specific segments should come before general ones.
 SEGMENT_MAP = {
-    "Politics and Government":   ["POLITICS", "GOV", "ELECTIONS", "LEADER"],
-    "Business and Markets":      ["ECON", "BUSINESS", "MARKETS", "FINANCE", "TRADE"],
-    "Technology":                ["TECH", "CYBER", "AI", "INTERNET", "INNOVATION"],
+    "Politics and Government":   ["POLITICS", "GOV", "ELECTIONS", "LEADER",
+                                  "ELECTION", "DEMOCRACY", "LEGISLATION",
+                                  "MILITARY", "ARMEDCONFLICT", "TERROR",
+                                  "EPU_POLICY_POLITICAL"],
+
+    "Business and Markets":      ["ECON", "BUSINESS", "MARKETS", "FINANCE",
+                                  "TRADE", "EPU_ECONOMY", "EPU_CATS_FINANCIAL",
+                                  "WB_855_LABOR", "STRIKE", "PROTEST"],
+
+    "Technology":                ["TECH", "CYBER", "AI", "INTERNET",
+                                  "INNOVATION", "WB_133_INFORMATION",
+                                  "WB_678_DIGITAL", "WB_667_ICT"],
+
     "Sports":                    ["SPORTS", "SPORT"],
-    "Entertainment and Culture": ["ENTERTAIN", "CULTURE", "ARTS", "MEDIA"],
-    "Science and Health":        ["HEALTH", "SCIENCE", "MEDICAL", "ENV"],
-    "Crime and Justice":         ["CRIME", "LEGAL", "JUSTICE", "LAW"],
+
+    "Entertainment and Culture": ["ENTERTAIN", "CULTURE", "ARTS", "MEDIA",
+                                  "TAX_ETHNICITY", "CRISISLEX_CRISISLEXREC"],
+
+    "Science and Health":        ["HEALTH", "SCIENCE", "MEDICAL", "ENV",
+                                  "WB_621_HEALTH", "WB_1331_HEALTH",
+                                  "NATURAL_DISASTER", "TAX_DISEASE"],
+
+    "Crime and Justice":         ["CRIME", "LEGAL", "JUSTICE", "LAW",
+                                  "SOC_GENERALCRIME", "ARREST", "TRIAL",
+                                  "KILL", "RETALIATE"],
 }
 
 FALLBACK_SEGMENT = "General"
